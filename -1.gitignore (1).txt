@@ -1,0 +1,27 @@
+# --- Dependencies ---
+node_modules/
+
+# --- Secrets (əsl .env HEÇ VAXT commit olunmamalıdır) ---
+.env
+.env.local
+.env.*.local
+
+# --- Runtime data (state faylı lokal saxlanılsa) ---
+seymur13-state.json
+*.state.json
+/data/
+
+# --- Log-lar ---
+npm-debug.log*
+logs/
+*.log
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Backtest çıxışları (əgər fayla yazırsansa) ---
+backtest-results/
+*.backtest.json
