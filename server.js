@@ -46,24 +46,30 @@ const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 72);
 const SIGNAL_COOLDOWN_MIN = Number(process.env.SIGNAL_COOLDOWN_MIN || 30);
 const CONFIDENCE_STEP = Number(process.env.CONFIDENCE_STEP || 15);
 const MAX_SLIPPAGE_PCT = Number(process.env.MAX_SLIPPAGE_PCT || 0.4); // siqnal qiyməti ilə icra anındakı bazar qiyməti arasında icazə verilən max fərq (%)
+// Minimum Risk:Reward — bundan aşağı olan siqnal confidence yüksək olsa belə AVTOMATIK icra edilmir.
+// Səbəb: yüksək "etibar faizi" ilə pis R:R kombinasiyası uzun müddətdə itki gətirir, çünki bir neçə
+// uğursuz əməliyyat bir uğurlunun qazancını asanlıqla silə bilər.
+const MIN_RR = Number(process.env.MIN_RR || 1.5);
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 // === Təhlükəsizlik / risk parametrləri ===
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || ''; // boşdursa trade/close/scanner endpoint-ləri qıfıllı qalır (heç kim çağıra bilməz)
 const MAX_DAILY_LOSS_PCT = Number(process.env.MAX_DAILY_LOSS_PCT || 5); // gündəlik equity-nin bu faizindən çox itki -> auto-trade avtomatik dayanır
-const STATE_FILE = process.env.STATE_FILE || '/tmp/seymur13-state.json'; // restart-dan sonra bərpa üçün
+const STATE_FILE = process.env.STATE_FILE || '/tmp/siqnal-pro-state.json'; // restart-dan sonra bərpa üçün
 // SCAN_SYMBOLS nümunəsi (Railway Variables-da təyin edilir), YA DA boş saxla/`AUTO_TOP30` yaz —
 // bu halda bot OKX-dan REAL 24saatlıq həcmə görə ən likvid 30 SWAP coini özü tapır.
 // === BTC-USDT-SWAP həmişə skan siyahısında olmalıdır (əsas fokus) ===
 const BTC_SYMBOL = 'BTC-USDT-SWAP';
 // İstifadəçinin prioritet sırası — bunlar siyahıda həmişə ƏN ÖNDƏ göstərilir (varsa)
-const PRIORITY_SYMBOLS = ['BTC-USDT-SWAP','ETH-USDT-SWAP','SOL-USDT-SWAP','XRP-USDT-SWAP','BNB-USDT-SWAP','DOGE-USDT-SWAP','SUI-USDT-SWAP','LINK-USDT-SWAP'];
-// Sabit 20 simvollu skan siyahısı (istifadəçinin seçdiyi coinlər). AUTO_TOP30 deaktivdir — məhz bu 20 coin skan olunur.
+const PRIORITY_SYMBOLS = ['BTC-USDT-SWAP','ETH-USDT-SWAP','SOL-USDT-SWAP','AVAX-USDT-SWAP','BNB-USDT-SWAP','BCH-USDT-SWAP','XRP-USDT-SWAP','DOGE-USDT-SWAP'];
+// Fallback (AUTO_TOP30 uğursuz olsa və ya SCAN_SYMBOLS yazılmasa istifadə olunan ~30 simvollu default siyahı)
 const DEFAULT_SYMBOLS = [
-  'BTC-USDT-SWAP','ETH-USDT-SWAP','SOL-USDT-SWAP','XRP-USDT-SWAP','BNB-USDT-SWAP',
-  'DOGE-USDT-SWAP','SUI-USDT-SWAP','LINK-USDT-SWAP','HYPE-USDT-SWAP','ADA-USDT-SWAP',
-  'AVAX-USDT-SWAP','LTC-USDT-SWAP','BCH-USDT-SWAP','PEPE-USDT-SWAP','TAO-USDT-SWAP',
-  'AAVE-USDT-SWAP','TRX-USDT-SWAP','XLM-USDT-SWAP','ZEC-USDT-SWAP','WLD-USDT-SWAP'
+  ...PRIORITY_SYMBOLS,
+  'ADA-USDT-SWAP','LINK-USDT-SWAP','DOT-USDT-SWAP','LTC-USDT-SWAP','TRX-USDT-SWAP',
+  'TON-USDT-SWAP','NEAR-USDT-SWAP','SUI-USDT-SWAP','APT-USDT-SWAP','ARB-USDT-SWAP',
+  'OP-USDT-SWAP','INJ-USDT-SWAP','FIL-USDT-SWAP','ATOM-USDT-SWAP','ETC-USDT-SWAP',
+  'ICP-USDT-SWAP','HBAR-USDT-SWAP','UNI-USDT-SWAP','AAVE-USDT-SWAP','SHIB-USDT-SWAP',
+  'TAO-USDT-SWAP','CRO-USDT-SWAP'
 ];
 function reorderPriority(list){
   const set=new Set(list);
@@ -72,9 +78,8 @@ function reorderPriority(list){
   return [...new Set([...head,...tail])];
 }
 const rawScanEnv=(process.env.SCAN_SYMBOLS||'').trim().toUpperCase();
-// Default olaraq sabit 20-lik siyahı skan olunur. AUTO_TOP30 yalnız SCAN_SYMBOLS=AUTO_TOP30 açıq yazılanda aktivləşir.
-const AUTO_TOP30 = rawScanEnv==='AUTO_TOP30';
-let symbols = (!rawScanEnv || AUTO_TOP30)
+const AUTO_TOP30 = !rawScanEnv || rawScanEnv==='AUTO_TOP30';
+let symbols = AUTO_TOP30
   ? DEFAULT_SYMBOLS.slice()
   : rawScanEnv.split(',').map(x=>x.trim()).filter(Boolean);
 symbols = reorderPriority(symbols);
@@ -96,7 +101,7 @@ async function discoverTop30(){
     return DEFAULT_SYMBOLS.slice();
   }
 }
-const TIMEFRAMES = ['15m','30m','1H','4H'];
+const TIMEFRAMES = ['1m','5m','15m','1H','4H'];
 // Konfluensiya hesablamasına DAXIL EDILMIR — yalnız əlavə kontekst (makro trend + gözlənilən aralıq) üçün
 const MACRO_TF = '1D';
 const HISTORY_LIMIT = 300;
@@ -297,12 +302,17 @@ function analyze(c){
   let score=0,reasons=[];
   if(e9>e21&&e21>e50){score+=1;reasons.push('EMA trend +');}else if(e9<e21&&e21<e50){score-=1;reasons.push('EMA trend -');}
   if(e200!=null){if(price>e200){score+=1;reasons.push('above EMA200');}else{score-=1;reasons.push('below EMA200');}}
-  if(rv<35){score+=1;reasons.push('RSI oversold');}else if(rv>65){score-=1;reasons.push('RSI overbought');}
   if(mv>0){score+=1;reasons.push('MACD +');}else if(mv<0){score-=1;reasons.push('MACD -');}
   if(bb){if(price<=bb.lower){score+=1;reasons.push('BB lower');}else if(price>=bb.upper){score-=1;reasons.push('BB upper');}}
-  if(st<20){score+=1;reasons.push('Stoch oversold');}else if(st>80){score-=1;reasons.push('Stoch overbought');}
-  if(cv<-100){score+=1;reasons.push('CCI oversold');}else if(cv>100){score-=1;reasons.push('CCI overbought');}
-  if(mf<25){score+=1;reasons.push('MFI low');}else if(mf>75){score-=1;reasons.push('MFI high');}
+  // === Momentum konsensusu (RSI+Stoch+CCI+MFI) ===
+  // Bu 4 indikator riyazi olaraq bir-biri ilə güclü korrelyasiyalıdır (hamısı overbought/oversold ölçür).
+  // Əvvəllər hərəsi ayrıca ±1 verirdi (max ±4) — bu, YALANÇI konfluensiya yaradırdı: "4 indikator razılaşdı"
+  // görünsə də, əslində 1 siqnalın 4 fərqli riyazi ifadəsi idi. İndi TƏK səs kimi sayılır (max ±1),
+  // və ən azı 2/4-nin razılaşmasını tələb edir (təkindikator küyünə qarşı filtr).
+  const momVotes=[rv<35?1:rv>65?-1:0, st<20?1:st>80?-1:0, cv<-100?1:cv>100?-1:0, mf<25?1:mf>75?-1:0];
+  const momSum=momVotes.reduce((a,b)=>a+b,0);
+  if(momSum>=2){score+=1;reasons.push(`momentum oversold (${momSum}/4 indikator)`);}
+  else if(momSum<=-2){score-=1;reasons.push(`momentum overbought (${-momSum}/4 indikator)`);}
   if(ob>0){score+=1;reasons.push('OBV rising');}else if(ob<0){score-=1;reasons.push('OBV falling');}
   if(str>0){score+=1;reasons.push('higher highs/lows');}else if(str<0){score-=1;reasons.push('lower highs/lows');}
   if(vw!=null){if(price>vw){score+=1;reasons.push('above VWAP');}else{score-=1;reasons.push('below VWAP');}}
@@ -310,13 +320,21 @@ function analyze(c){
   if(psar){if(psar.uptrend){score+=1;reasons.push('Parabolic SAR yüksəliş');}else{score-=1;reasons.push('Parabolic SAR düşüş');}}
   if(piv){if(price>piv.pp){score+=1;reasons.push('Pivot üzərində');}else if(price<piv.pp){score-=1;reasons.push('Pivot altında');}}
   if(fib){if(price>fib.r500){score+=1;reasons.push('Fib 50% üzərində');}else{score-=1;reasons.push('Fib 50% altında');}}
-  let confidence=Math.round(Math.min(100,Math.abs(score)/15*100));
+  // Momentum konsolidasiyasından sonra max mümkün score 15-dən 12-yə düşür (12 müstəqil komponent)
+  let confidence=Math.round(Math.min(100,Math.abs(score)/12*100));
   // ADX trendin real/saxta olduğunu göstərir: güclü trenddə confidence yüksəlir, "chop" bazarda aşağı düşür
   if(ax!=null){
     if(ax>=25){confidence=Math.min(100,confidence+8);reasons.push(`ADX güclü trend (${ax.toFixed(0)})`);}
     else if(ax<15){confidence=Math.max(0,confidence-12);reasons.push(`ADX zəif/yan bazar (${ax.toFixed(0)})`);}
   }
-  const signal=score>=4?'LONG':score<=-4?'SHORT':'WAIT';
+  let signal=score>=4?'LONG':score<=-4?'SHORT':'WAIT';
+  // === Chop filtri: ADX çox zəifdirsə (yan bazar), indikatorlar nə qədər "razılaşsa" belə etibar etmə ===
+  // Bu, mübadilə indikatorlarının ən çox yanıldığı şərait — trend yoxdur, hər siqnal təsadüfi sayıla bilər.
+  const MIN_ADX=Number(process.env.MIN_ADX||15);
+  if(signal!=='WAIT' && ax!=null && ax<MIN_ADX){
+    reasons.push(`Chop filtri: ADX (${ax.toFixed(0)}) < ${MIN_ADX} — siqnal WAIT-a endirildi`);
+    signal='WAIT';
+  }
   if(!av)return{signal,confidence,score,price,adx:ax,vwap:vw,reasons};
   const swingLow=Math.min(...c.slice(-20).map(x=>x.l)),swingHigh=Math.max(...c.slice(-20).map(x=>x.h));
   let sl=null,tp1=null,tp2=null,tp3=null,rr=0;
@@ -363,30 +381,36 @@ async function fetchCandleHistory(symbol,tf){
 }
 function getCandles(symbol,tf){return state.candles.get(key(symbol,tf))||[];}
 // === TF konfluensiya / trigger məntiqi ===
-// Əsas qayda (istifadəçinin istədiyi kimi): sürətli timeframe (15m) ilə yuxarı timeframe (1H)
+// Əsas qayda (istifadəçinin istədiyi kimi): sürətli timeframe (1m) ilə yuxarı timeframe (1H)
 // EYNİ istiqaməti göstərəndə bu, erkən "giriş triqqeri" sayılır — hətta əsas siqnal hələ WAIT-da
-// olsa belə (3/4 TF hədəfi tam ötməyib), 15m+1H uyğunluğu bazarın hansı tərəfə meyilləndiyini göstərir.
+// olsa belə (4/5 TF hədəfi tam ötməyib), 1m+1H uyğunluğu bazarın hansı tərəfə meyilləndiyini göstərir.
 // Bunu əsas LONG/SHORT siqnalı ilə QARIŞDIRMAMAQ üçün ayrıca "trigger" sahəsi kimi qaytarılır.
 function computeConfluence(tfMap){
-  const order=['15m','30m','1H','4H'];
+  const order=['1m','5m','15m','1H','4H'];
   const sig=tf=>tfMap[tf]?.signal||null;
   const longs=order.filter(tf=>sig(tf)==='LONG').length;
   const shorts=order.filter(tf=>sig(tf)==='SHORT').length;
   const waits=order.length-longs-shorts;
-  // Trigger: sürətli TF (15m) həm 30m, həm də 1H (trend filtri) ilə eyni istiqamətdədirsə -> güclü erkən işarə
-  const fast=sig('15m'), midf=sig('30m'), trendf=sig('1H');
+  // Trigger: sürətli TF (1m) həm 5m, həm də 1H (trend filtri) ilə eyni istiqamətdədirsə -> güclü erkən işarə
+  const fast=sig('1m'), midf=sig('5m'), trendf=sig('1H');
   let trigger=null;
   if(fast && fast!=='WAIT' && fast===trendf){
-    trigger={dir:fast, tfs: fast===midf?['15m','30m','1H']:['15m','1H'], strong: fast===midf};
+    trigger={dir:fast, tfs: fast===midf?['1m','5m','1H']:['1m','1H'], strong: fast===midf};
   }
   return{longs,shorts,waits,total:order.length,trigger};
 }
 async function fullAnalysis(symbol){
   const frames=TIMEFRAMES,a={};for(const tf of frames)a[tf]=analyze(getCandles(symbol,tf));
-  const valid=frames.map(x=>a[x]).filter(Boolean);if(valid.length<4)return null;
+  const valid=frames.map(x=>a[x]).filter(Boolean);if(valid.length<5)return null;
   const longs=valid.filter(x=>x.signal==='LONG').length,shorts=valid.filter(x=>x.signal==='SHORT').length;
-  // 4 timeframe-dən min. 3-ü (75%) eyni istiqamətdə olmalıdır ki, LONG/SHORT siqnalı yaransın (əvvəlki 4/5 ≈ 80%-ə ekvivalent)
-  let final='WAIT';if(longs>=3)final='LONG';else if(shorts>=3)final='SHORT';
+  let final='WAIT';if(longs>=4)final='LONG';else if(shorts>=4)final='SHORT';
+  // === HTF (1H/4H) veto ===
+  // Aşağı timeframe-lər (1m/5m/15m) tez-tez qısamüddətli küy yaradır. Əgər 4/5 TF "razılaşsa" belə,
+  // əsas trend timeframe-ləri (1H, 4H) əks istiqamətdə göstərirsə, bu, real yanlış siqnal riskidir —
+  // əvvəllər HTF-in fikri nəzərə alınmırdı. İndi 1H və ya 4H açıq şəkildə əksinə deyirsə, WAIT-a düşür.
+  const htf1h=a['1H']?.signal, htf4h=a['4H']?.signal;
+  if(final==='LONG' && (htf1h==='SHORT' || htf4h==='SHORT')) final='WAIT';
+  if(final==='SHORT' && (htf1h==='LONG' || htf4h==='LONG')) final='WAIT';
   const base=a['15m'];if(!base)return null;
   let conf=Math.round(valid.reduce((s,x)=>s+x.confidence,0)/valid.length);
   const fundingRate=state.fundingRate.get(symbol)??null;
@@ -482,7 +506,7 @@ function signalMessage(r){
       `Etibar: <b>${r.confidence}%</b> ${confBar(r.confidence)}`
     ];
     if(r.confluence){
-      lines.push(`Uyğunluq: 🟢${r.confluence.longs}/4 🔴${r.confluence.shorts}/4 ⚪${r.confluence.waits}/4 (min. 3/4)`);
+      lines.push(`Uyğunluq: 🟢${r.confluence.longs}/5 🔴${r.confluence.shorts}/5 ⚪${r.confluence.waits}/5 (min. 4/5)`);
       const t=r.confluence.trigger;
       if(t&&t.dir!==r.signal)lines.push(`🎯 Erkən (${t.tfs.join('+')}): ${t.dir==='LONG'?'AL':'SAT'} formalaşır`);
     }
@@ -607,7 +631,7 @@ async function scan(){
         const item={...r,time:now};state.signals.unshift(item);state.signals=state.signals.slice(0,200);
         state.lastSignalAt.set(symbol,now);state.lastReportedConfidence.set(symbol,r.confidence);
         await sendTelegram(signalMessage(r));
-        if(r.signal!=='WAIT'&&r.confidence>=MIN_CONFIDENCE&&AUTO_TRADE&&TRADING_ENABLED){
+        if(r.signal!=='WAIT'&&r.confidence>=MIN_CONFIDENCE&&r.rr>=MIN_RR&&AUTO_TRADE&&TRADING_ENABLED){
           const open=await getOpenPositions();if(open.length<MAX_OPEN_POSITIONS)await executeTrade(symbol,r);
         }
       }
@@ -698,7 +722,7 @@ async function verifyTelegramSetup(){
 }
 async function handleTelegram(cmd){
   const [c,...args]=cmd.split(/\s+/),name=c.toLowerCase();
-  if(name==='/start'||name==='/status')return sendTelegram(`<b>SEYMUR13 ONLINE</b>\nScanner: ${state.scannerEnabled?'🟢':'🔴'}\nTrading: ${TRADING_ENABLED?'🟢':'🔴'}\nAuto trade: ${AUTO_TRADE?'🟢':'🔴'} (min. etibar: ${MIN_CONFIDENCE}%)\nKill-switch: ${state.tradingHalted?`🛑 ${state.haltReason}`:'🟢 aktiv deyil'}\nWS: ${state.wsConnected?'🟢':'🔴'}\nUptime: ${Math.floor((Date.now()-state.startedAt)/3600000)}h\n\nManual giriş üçün: /open SYMBOL LONG|SHORT CONFIRM`);
+  if(name==='/start'||name==='/status')return sendTelegram(`<b>SIQNAL PRO ONLINE</b>\nScanner: ${state.scannerEnabled?'🟢':'🔴'}\nTrading: ${TRADING_ENABLED?'🟢':'🔴'}\nAuto trade: ${AUTO_TRADE?'🟢':'🔴'} (min. etibar: ${MIN_CONFIDENCE}%, min. R:R: 1:${MIN_RR}, min. ADX: ${process.env.MIN_ADX||15})\nKill-switch: ${state.tradingHalted?`🛑 ${state.haltReason}`:'🟢 aktiv deyil'}\nWS: ${state.wsConnected?'🟢':'🔴'}\nUptime: ${Math.floor((Date.now()-state.startedAt)/3600000)}h\n\nManual giriş üçün: /open SYMBOL LONG|SHORT CONFIRM`);
   if(name==='/stop'){state.scannerEnabled=false;return sendTelegram('🛑 Scanner dayandırıldı.');}
   if(name==='/resume'||name==='/startscan'){state.scannerEnabled=true;return sendTelegram('🟢 Scanner aktivdir.');}
   if(name==='/signals')return sendTelegram(state.signals.slice(0,5).map(x=>signalMessage(x)).join('\n\n')||'Siqnal yoxdur.');
@@ -706,13 +730,13 @@ async function handleTelegram(cmd){
   if(name==='/balance'){try{const b=await getBalance();return sendTelegram(`USDT equity: ${b?.totalEq||'--'}\nAvailable: ${b?.details?.find(x=>x.ccy==='USDT')?.availEq||'--'}`);}catch(e){return sendTelegram('OKX: '+e.message);}}
   if(name==='/analyse'||name==='/analyze'){const s=args[0]||activeSymbols[0];const r=await fullAnalysis(s);return sendTelegram(r?signalMessage(r):'Analiz üçün kifayət qədər data yoxdur.');}
   if(name==='/close'){const s=args[0];if(!s)return sendTelegram('İstifadə: /close BTC-USDT-SWAP');try{await closePosition(s);return;}catch(e){return sendTelegram('Close xətası: '+e.message);}}
-  // === Manual giriş: MIN_CONFIDENCE həddini gözləmədən İSTƏNİLƏN VAXT özün AL/SAT aça bilərsən ===
+  // === Manual giriş: 72% (MIN_CONFIDENCE) həddini gözləmədən İSTƏNİLƏN VAXT özün AL/SAT aça bilərsən ===
   // Botun avtomatik ticarəti (AUTO_TRADE) hələ də yalnız MIN_CONFIDENCE-dən yuxarı siqnallarda işə düşür —
   // bu komanda YALNIZ sənin əl ilə, şüurlu şəkildə açdığın mövqelər üçündür. Səhvən basmamaq üçün
   // sonuna mütləq "CONFIRM" yazmalısan.
   if(name==='/open'){
     const s=(args[0]||'').toUpperCase(), side=(args[1]||'').toUpperCase(), confirm=(args[2]||'').toUpperCase();
-    if(!s||!['LONG','SHORT'].includes(side))return sendTelegram(`İstifadə: /open BTC-USDT-SWAP LONG CONFIRM  (və ya SHORT)\nBu, etibar faizindən (${MIN_CONFIDENCE}%) asılı olmadan DƏRHAL manual sifariş göndərir.`);
+    if(!s||!['LONG','SHORT'].includes(side))return sendTelegram('İstifadə: /open BTC-USDT-SWAP LONG CONFIRM  (və ya SHORT)\nBu, etibar faizindən (72%) asılı olmadan DƏRHAL manual sifariş göndərir.');
     if(!activeSymbols.includes(s))return sendTelegram(`Naməlum simvol: ${s}\nAktiv simvollar: ${activeSymbols.join(', ')}`);
     if(!TRADING_ENABLED)return sendTelegram('TRADING_ENABLED=false — real ticarət server tərəfdə deaktivdir, açıla bilməz.');
     if(confirm!=='CONFIRM')return sendTelegram(`⚠️ Bu, real pulla ${side} mövqeyi açacaq (${s}).\nƏmin olduğunu təsdiqləmək üçün sonuna "CONFIRM" əlavə edib yenidən göndər:\n/open ${s} ${side} CONFIRM`);
@@ -724,6 +748,9 @@ async function handleTelegram(cmd){
       const manual={...r,signal:side,price:lv.price,sl:lv.sl,tp1:lv.tp1,tp2:lv.tp2,tp3:lv.tp3,rr:lv.rr};
       if(r.confidence<MIN_CONFIDENCE){
         await sendTelegram(`⚠️ DİQQƏT: Hazırkı etibar faizi ${r.confidence}% — tövsiyə olunan minimumdan (${MIN_CONFIDENCE}%) aşağıdır.\nBu, botun özünün seçdiyi güclü siqnal deyil, sənin manual qərarındır. Risk sənin üzərindədir — davam edilir...`);
+      }
+      if(manual.rr<MIN_RR){
+        await sendTelegram(`⚠️ DİQQƏT: R:R nisbəti (1:${manual.rr.toFixed(2)}) minimumdan (1:${MIN_RR}) aşağıdır — risk mükafata nisbətən yüksəkdir. Davam edilir...`);
       }
       await executeTrade(s,manual);
     }catch(e){return sendTelegram('Manual open xətası: '+e.message);}
@@ -763,16 +790,16 @@ app.get('/api/candles/:symbol/:tf',(req,res)=>{
   res.json(getCandles(symbol,tf));
 });
 app.post('/api/scanner',requireAdmin,(req,res)=>{state.scannerEnabled=!!req.body.enabled;res.json(publicState());});
-app.post('/api/trade',requireAdmin,async(req,res)=>{try{const{symbol,side}=req.body;if(!symbol||!['LONG','SHORT'].includes(side))return res.status(400).json({error:'symbol and side (LONG|SHORT) required'});if(!activeSymbols.includes(symbol))return res.status(400).json({error:'unknown symbol'});const r=await fullAnalysis(symbol);if(!r||r.signal!==side)return res.status(400).json({error:'Signal does not confirm requested side'});if(!TRADING_ENABLED)return res.status(403).json({error:'TRADING_ENABLED=false'});const out=await executeTrade(symbol,r);res.json({ok:true,out});}catch(e){res.status(400).json({error:e.message});}});
+app.post('/api/trade',requireAdmin,async(req,res)=>{try{const{symbol,side}=req.body;if(!symbol||!['LONG','SHORT'].includes(side))return res.status(400).json({error:'symbol and side (LONG|SHORT) required'});if(!activeSymbols.includes(symbol))return res.status(400).json({error:'unknown symbol'});const r=await fullAnalysis(symbol);if(!r||r.signal!==side)return res.status(400).json({error:'Signal does not confirm requested side'});if(r.rr<MIN_RR)return res.status(400).json({error:`R:R (${r.rr.toFixed(2)}) is below minimum (${MIN_RR})`});if(!TRADING_ENABLED)return res.status(403).json({error:'TRADING_ENABLED=false'});const out=await executeTrade(symbol,r);res.json({ok:true,out});}catch(e){res.status(400).json({error:e.message});}});
 app.get('/api/balance',requireAdmin,async(req,res)=>{try{res.json(await getBalance());}catch(e){res.status(400).json({error:e.message});}});
 app.get('/api/positions',requireAdmin,async(req,res)=>{try{res.json(await getOpenPositions());}catch(e){res.status(400).json({error:e.message});}});
 app.post('/api/close',requireAdmin,async(req,res)=>{try{if(!TRADING_ENABLED)return res.status(403).json({error:'TRADING_ENABLED=false'});const out=await closePosition(String(req.body.symbol||'').toUpperCase());res.json({ok:true,out});}catch(e){res.status(400).json({error:e.message});}});
 
-const server=app.listen(PORT,async()=>{console.log(`SEYMUR13 server on :${PORT}`);await initDb();await loadState();if(!ADMIN_API_KEY)console.warn('XƏBƏRDARLIQ: ADMIN_API_KEY təyin edilməyib — /api/trade, /api/close, /api/scanner, /api/balance, /api/positions, /api/notify deaktiv olacaq.');try{if(AUTO_TOP30){symbols=await discoverTop30();if(!symbols.includes(BTC_SYMBOL))symbols.unshift(BTC_SYMBOL);console.log('AUTO_TOP30: OKX-da real həcmə görə seçilən simvollar:',symbols.join(', '));}await loadInstruments();activeSymbols=symbols.filter(s=>state.instruments.has(s));const skipped=symbols.filter(s=>!state.instruments.has(s));if(skipped.length)console.warn('OKX SWAP-da tapılmadı, ötürüldü:',skipped.join(', '));for(const s of activeSymbols)for(const tf of [...TIMEFRAMES,MACRO_TF]){try{await fetchCandleHistory(s,tf);}catch(e){console.error(`Candle load failed ${s} ${tf}:`,e.message);}await new Promise(r=>setTimeout(r,250));}
+const server=app.listen(PORT,async()=>{console.log(`SIQNAL PRO server on :${PORT}`);await initDb();await loadState();if(!ADMIN_API_KEY)console.warn('XƏBƏRDARLIQ: ADMIN_API_KEY təyin edilməyib — /api/trade, /api/close, /api/scanner, /api/balance, /api/positions, /api/notify deaktiv olacaq.');try{if(AUTO_TOP30){symbols=await discoverTop30();if(!symbols.includes(BTC_SYMBOL))symbols.unshift(BTC_SYMBOL);console.log('AUTO_TOP30: OKX-da real həcmə görə seçilən simvollar:',symbols.join(', '));}await loadInstruments();activeSymbols=symbols.filter(s=>state.instruments.has(s));const skipped=symbols.filter(s=>!state.instruments.has(s));if(skipped.length)console.warn('OKX SWAP-da tapılmadı, ötürüldü:',skipped.join(', '));for(const s of activeSymbols)for(const tf of [...TIMEFRAMES,MACRO_TF]){try{await fetchCandleHistory(s,tf);}catch(e){console.error(`Candle load failed ${s} ${tf}:`,e.message);}await new Promise(r=>setTimeout(r,250));}
     // Başlanğıc təsdiqi — server sükutla "işə düşüb amma heç nə göstərmir" vəziyyətinə düşəndə bunu görmək üçün
     const loadedOk=activeSymbols.filter(s=>getCandles(s,'15m').length>=60);
     const telegramOk=await verifyTelegramSetup();
-    if(telegramOk)await sendTelegram(`✅ <b>SEYMUR13 başladı</b>\nİzlənilən: ${activeSymbols.length} simvol\nData yükləndi: ${loadedOk.length}/${activeSymbols.length}\n${loadedOk.length<activeSymbols.length?'⚠️ Bəziləri yüklənmədi — Railway loglarına bax.':''}`);
+    if(telegramOk)await sendTelegram(`✅ <b>SIQNAL PRO başladı</b>\nİzlənilən: ${activeSymbols.length} simvol\nData yükləndi: ${loadedOk.length}/${activeSymbols.length}\n${loadedOk.length<activeSymbols.length?'⚠️ Bəziləri yüklənmədi — Railway loglarına bax.':''}`);
     connectMarketWS();setInterval(scan,15000);setInterval(async()=>{try{await getOpenPositions();broadcast({type:'positions',positions:state.positions});}catch(e){state.lastError=e.message;}},10000);telegramLoop();fetchFundingAndOI(BTC_SYMBOL);setInterval(()=>fetchFundingAndOI(BTC_SYMBOL),60000);setInterval(saveState,20000);}catch(e){state.lastError=e.message;console.error(e);}});
 const wss=new WebSocketServer({server,path:'/ws'});wss.on('connection',ws=>{state.clients.add(ws);ws.send(JSON.stringify({type:'state',...publicState()}));ws.on('close',()=>state.clients.delete(ws));});
 process.on('SIGTERM',()=>{state.telegramRunning=false;saveState();server.close();});
